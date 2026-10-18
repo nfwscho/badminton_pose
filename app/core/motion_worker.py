@@ -2,6 +2,8 @@
 # MediaPipe나 영상 디코더를 호출하지 않는다. 입력 스냅샷과 결과를 전달하고
 # UI는 문맥/세대 검사를 통해 오래된 작업 결과를 폐기한다. 진행/제외/분류를
 # 요약 로그로 남기며 동영상 재생 프레임마다 로그를 출력하지 않는다.
+# 선택적으로 관절 실행/캐시/측정 지문을 결과에 포함하여 현재 선수 연결 진단에 사용한다.
+from dataclasses import replace
 from collections import Counter
 import logging
 import time
@@ -9,6 +11,7 @@ from PySide6.QtCore import QThread, Signal
 from app.analysis.motion_features import extract_features
 from app.analysis.motion_detector import detect_motion
 from app.analysis.motion_models import ALGORITHM_VERSION
+from app.analysis.coach_engine import source_key
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +46,12 @@ class MotionWorker(QThread):
                                    self.config, self.scope, self.isInterruptionRequested)
             if result is None or self.isInterruptionRequested():
                 return
+            if hasattr(self, "provenance"):
+                provenance = {**self.provenance, "measurement_key": source_key(self.frames, self.selections, self.measurements,
+                                                                               self.timeline, self.config, self.isInterruptionRequested)}
+                if self.isInterruptionRequested():
+                    return
+                result = replace(result, provenance=provenance)
             counts = Counter(event.kind for event in result.events)
             log.info("스윙 분석 종료: candidates=%s, overhead=%s, other=%s, 보류=%s, %.3f초",
                      len(result.events), counts["OVERHEAD_CANDIDATE"], counts["OTHER_SWING"], counts["UNKNOWN"], time.monotonic() - start)

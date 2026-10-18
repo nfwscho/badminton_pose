@@ -2,6 +2,7 @@
 # 백그라운드 응답, 기존 A/B 보존, 실제 타임라인 마우스 탐색, 수동 적용/취소,
 # 재분석 확인, JSON 재로딩과 선택 구간 재생/반복을 검증한다. 영상 인식 정확도
 # 검증과 구분하며 포즈 추론을 호출하지 않는다.
+# 코칭 준비 검사와도 연결할 수 있도록 임시 영상의 실제 원본/모델 캐시 서명을 설정한다.
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from dataclasses import replace
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from test_motion import synthetic_case
 from app.analysis.motion_detector import manual_event
+from app.core.frame_processor import cache_key
 from app.ui.main_window import MainWindow
 from app.ui.motion_panel import MotionEditDialog
 
@@ -45,6 +47,7 @@ class MotionUiTests(unittest.TestCase):
         frames, selections, measurements, _, _, _ = synthetic_case()
         self.w.cache.frames, self.w.cache.selections, self.w.cache.measurements = frames, selections, measurements
         self.w.cache.anchor, self.w.cache.state = (0, 0), "complete"
+        self.w.cache.key = cache_key(self.path)
         self.w.refresh_measurements()
         self.w.motion.hand_combo.setCurrentIndex(self.w.motion.hand_combo.findData("right"))
         self.w.render_frame()

@@ -3,6 +3,9 @@
 # 적용되지 않게 한다. 자동 결과와 수동 문서를 분리하고 재분석 덮어쓰기 전에
 # 명시적으로 확인한다. 저장 기록은 현재 선수 캐시와 확인되기 전 과거 관측으로 표시한다.
 # 코칭 컨트롤러에는 문서/입력 상태 변경과 이벤트 선택 신호만 전달한다.
+# 구체적인 입력 변경 사유/관절 실행 출처를 기록하고 A/B 표시 범위 변경은 기존
+# 스윙의 선수 연결과 구분한다. 새 검출 결과의 첫 후보는 선택만 하며 검토를 승인하지 않는다.
+# 서로 폭이 다른 그래프/타임라인은 화면 픽셀 정렬 대신 동일 PTS 범위로 동기화한다.
 from bisect import bisect_right
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
@@ -15,7 +18,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QHBoxLayout, QInpu
                               QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QWidget)
 
 from app.analysis.motion_detector import manual_event
-from app.analysis.motion_models import MotionConfig, MotionDocument, PHASE_LABELS, make_context
+from app.analysis.motion_models import MotionConfig, MotionDocument, PHASE_LABELS, fingerprint, make_context
 from app.analysis.motion_store import MotionStore
 from app.core.motion_worker import MotionWorker
 from app.core.video_timeline import video_identity
@@ -39,6 +42,9 @@ class MotionController(QObject):
         self.workers, self.graph_markers = [], []
         self.epoch, self.events, self.starts = 0, [], []
         self.pending_documents = []
+        self.last_error = ""
+        self.syncing_x = False
+        self.last_panel_size = window.settings.value("motion/lastHeight", 180, type=int)
         try:
             config = json.loads(window.settings.value("motion/config", "{}"))
             self.config = MotionConfig(**config)
@@ -77,7 +83,12 @@ class MotionController(QObject):
         self.panel = MotionPanel(window)
         window.content_splitter.addWidget(self.panel)
         self.panel.setVisible(self.panel_check.isChecked())
-        self.panel.timeline_plot.setXLink(window.measurement_panel.plot)
+        # pyqtgraph의 기본 XLink는 화면 위치/폭을 맞추므로 폭이 다른 패널에서는
+        # 시간 범위가 달라질 수 있다. 동일 원본 초 범위를 양방향으로 연결한다.
+        self.panel.timeline_plot.getViewBox().sigXRangeChanged.connect(
+            lambda view, bounds: self.sync_time_range(window.measurement_panel.plot, bounds))
+        window.measurement_panel.plot.getViewBox().sigXRangeChanged.connect(
+            lambda view, bounds: self.sync_time_range(self.panel.timeline_plot, bounds))
         self.panel.loop_check.setChecked(window.settings.value("motion/loop", False, type=bool))
         self.detect_button.clicked.connect(self.run_analysis)
         self.cancel_button.clicked.connect(self.cancel_requested)
@@ -108,10 +119,22 @@ class MotionController(QObject):
         self.update_controls()
 
     def show_panel(self, visible):
+        if not visible and self.panel.isVisible():
+            self.last_panel_size = self.w.content_splitter.sizes()[2]
         self.panel.setVisible(visible)
         if visible:
-            # 새 패널의 기본 sizeHint가 영상 영역을 대부분 차지하지 않도록 한다.
-            self.w.content_splitter.setSizes([600, 180, 180])
+            sizes = self.w.content_splitter.sizes()
+            sizes[2] = max(120, self.last_panel_size)
+            self.w.content_splitter.setSizes(sizes)
+
+    def sync_time_range(self, target, bounds):
+        if self.syncing_x:
+            return
+        self.syncing_x = True
+        try:
+            target.setXRange(bounds[0], bounds[1], padding=0)
+        finally:
+            self.syncing_x = False
 
     def current_context(self):
         if not self.w.timeline or not self.w.cache.anchor or not self.w.cache.measurements or self.hand_combo.currentData() is None:
@@ -127,6 +150,41 @@ class MotionController(QObject):
     def scope(self):
         return (self.w.range_a if self.w.range_a is not None else 0,
                 self.w.range_b if self.w.range_b is not None else self.w.count - 1)
+
+    def change_reasons(self):
+        if not self.document:
+            return ()
+        source, reasons = self.document.automatic, []
+        context = self.current_context()
+        if self.w.timeline and source.video_identity != tuple(self.w.timeline.identity):
+            reasons.append(("video", "원본 영상이 변경됨 — 영상을 다시 열고 관절 분석 필요"))
+        if self.hand_combo.currentData() != source.racket_hand:
+            reasons.append(("hand", "라켓 손 설정 변경 — 해당 손의 스윙 검출 갱신 필요"))
+        if context and (context["athlete_key"] != source.athlete_key or context["player_id"] != source.player_id):
+            reasons.append(("player", "분석 선수 또는 선택 세션 변경 — 선수 연결 확인 필요"))
+        if self.config != source.config:
+            reasons.append(("config", "스윙 검출 민감도/평활화/시간 설정 변경 — 스윙 갱신 필요"))
+        if self.scope() != source.scope:
+            reasons.append(("scope", "다음 스윙 검출의 A/B 범위 변경 (기존 이벤트/통계와 독립)"))
+        provenance = source.provenance
+        if provenance and provenance.get("pose_run_id") != self.w.cache.run_id:
+            reasons.append(("pose", "관절 분석 실행 변경 — 캐시·선수 연결 재검증 필요"))
+        return tuple(reasons)
+
+    def current_ready(self):
+        context = self.current_context()
+        blocking = [code for code, _ in self.change_reasons() if code != "scope"]
+        return (self.connection_ready() and context is not None and not blocking
+                and context["context_id"] == self.document.automatic.context_id
+                and context["player_id"] == self.document.automatic.player_id)
+
+    def connection_ready(self):
+        context = self.current_context()
+        return (self.document is not None and context is not None and not self.historical
+                and context["athlete_key"] == self.document.automatic.athlete_key
+                and context["player_id"] == self.document.automatic.player_id
+                and (not self.document.automatic.provenance or
+                     self.document.automatic.provenance.get("pose_run_id") == self.w.cache.run_id))
 
     def update_controls(self):
         busy = bool(self.workers)
@@ -224,9 +282,11 @@ class MotionController(QObject):
             return
         self.epoch += 1
         token = self.epoch
+        self.last_error = ""
         worker = MotionWorker(self.w.cache.frames, self.w.cache.selections, self.w.cache.measurements,
                               self.w.timeline, self.w.original.width(), self.w.original.height(), self.hand_combo.currentData(),
                               self.config, context, self.scope(), self)
+        worker.provenance = {"pose_run_id": self.w.cache.run_id, "pose_cache_key": fingerprint(self.w.cache.key)}
         self.workers.append(worker)
         worker.progress.connect(lambda value: self.progress.setValue(value) if token == self.epoch else None)
         worker.ready.connect(lambda result, features: self.accept_result(token, result, features))
@@ -243,7 +303,7 @@ class MotionController(QObject):
             return
         self.document, self.features = MotionDocument(result, result.events), features
         self.historical, self.stale = False, False
-        self.panel.selected_id = None
+        self.panel.selected_id = result.events[0].event_id if result.events else None
         self.unsaved = True
         self.save_document()
         self.refresh()
@@ -254,6 +314,9 @@ class MotionController(QObject):
             self.workers.remove(worker)
         worker.deleteLater()
         self.update_controls()
+        # ready는 finished보다 먼저 전달된다. 작업 목록에서 제거한 후 코칭/진단도
+        # 갱신해야 재생/마우스 조작 없이 즉시 실행 버튼이 활성화된다.
+        self.changed.emit()
 
     def cancel(self):
         for worker in self.workers:
@@ -266,7 +329,12 @@ class MotionController(QObject):
         log.info("스윙 검출 취소 요청")
 
     def refresh(self):
-        self.panel.set_document(self.document, self.w.timeline, self.historical, self.stale)
+        needs_recompute = self.stale and any(code != "scope" for code, _ in self.change_reasons())
+        self.panel.set_document(self.document, self.w.timeline, self.historical, needs_recompute)
+        if self.document and (self.historical or self.stale):
+            reasons = [reason for _, reason in self.change_reasons()]
+            self.panel.status_label.setText(self.panel.status_label.text() + " | " +
+                ("; ".join(reasons) if reasons else "저장 선수 연결 확인 필요 — 상단 실행 조건 확인에서 검사하세요."))
         self.events = sorted(self.document.events, key=lambda event: event.start_frame) if self.document else []
         self.starts = [event.start_frame for event in self.events]
         self.draw_graph_phases()
@@ -284,7 +352,8 @@ class MotionController(QObject):
         if event:
             phase = next((p for p in event.phases if p.start_frame <= index <= p.end_frame), None)
             label = PHASE_LABELS[phase.phase] if phase else "단계 보류"
-            status = "저장 기록, 현재 선수 연결 미확인" if self.historical else "기존 결과·현재 설정으로 재검출 필요" if self.stale else "규칙 후보·수동 검토 필요"
+            status = ("저장 선수 연결 확인 필요 — 상단 실행 조건 확인" if self.historical else
+                      "선수/설정 변경 — 실행 조건 확인에서 필요한 작업 보기" if not self.current_ready() else "규칙 후보·수동 검토 필요")
             self.phase_label.setText(f"동작 단계: {label} / {event.kind} — {status}")
         elif self.document:
             interval = next((c for c in self.document.automatic.coverage if c.start_frame <= index <= c.end_frame), None)
@@ -431,6 +500,7 @@ class MotionController(QObject):
             self.show_error("스윙 결과 읽기 실패: " + str(exc))
 
     def show_error(self, message):
+        self.last_error = message
         log.error("스윙 기능 오류: %s", message)
         self.w.statusBar().showMessage(message)
         QMessageBox.warning(self.w, "스윙 분석 오류", message)
@@ -457,4 +527,7 @@ class MotionController(QObject):
         self.w.settings.setValue("motion/showPanel", self.panel_check.isChecked())
         self.w.settings.setValue("motion/loop", self.panel.loop_check.isChecked())
         self.w.settings.setValue("motion/splitter", self.w.content_splitter.saveState())
+        if self.panel.isVisible():
+            self.last_panel_size = self.w.content_splitter.sizes()[2]
+        self.w.settings.setValue("motion/lastHeight", self.last_panel_size)
         return True

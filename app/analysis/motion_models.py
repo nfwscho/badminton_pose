@@ -2,6 +2,7 @@
 # 실제 영상 PTS/프레임, 선택 선수의 문맥 키, 근거/불확실성과 원본/수정 결과를
 # UI와 독립적으로 보존한다. 구질/임팩트/자세 품질을 확정하는 모델이 아니다.
 # 경계·순서·신원·중복 유효성 검사를 자동 결과와 수동/JSON 입력에 공통 적용한다.
+# 선택적 provenance는 관절 실행/캐시 지문을 저장하며 구버전 JSON은 빈 출처로 읽는다.
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
@@ -110,6 +111,7 @@ class MotionResult:
     analysis_key: str
     source_anchor: dict
     algorithm_version: str = ALGORITHM_VERSION
+    provenance: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

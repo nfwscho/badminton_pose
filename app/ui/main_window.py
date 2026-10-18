@@ -9,6 +9,7 @@
 # 데이터는 유지한다. 입력 변경/종료 시 새 작업의 취소 및 문서 보존도 요청한다.
 # CoachController로 품질 검사 기반 관찰·코칭 검토 패널, 근거 탐색과 사용자 검토를
 # 추가하며 기존 캐시와 A/B/스윙 데이터를 보존한다. 코칭도 종료 전 취소/저장한다.
+# 통합 분석 상태/실행 조건 진단과 단계별 다음 작업을 연결하고 진단 작업도 안전하게 종료한다.
 import logging
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from app.ui.pose_overlay import VideoLabel, draw_angle_overlay, draw_overlay
 from app.ui.measurement_panel import MeasurementPanel
 from app.ui.motion_controller import MotionController
 from app.ui.coach_controller import CoachController
+from app.ui.analysis_workflow import AnalysisWorkflow
 
 log = logging.getLogger(__name__)
 
@@ -164,6 +166,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("준비")
         self.motion = MotionController(self, settings_path, layout)
         self.coach = CoachController(self, settings_path, layout)
+        self.workflow = AnalysisWorkflow(self, layout)
         self.player.start()
 
     def set_controls(self, enabled):
@@ -274,6 +277,8 @@ class MainWindow(QMainWindow):
             self.motion.update_controls()
         if hasattr(self, "coach"):
             self.coach.update_controls()
+        if hasattr(self, "workflow"):
+            self.workflow.refresh()
 
     def start_analysis(self):
         if self.video_path is None or self.analysis_worker is not None:
@@ -438,6 +443,8 @@ class MainWindow(QMainWindow):
             self.start_measurements()
         if hasattr(self, "motion"):
             self.motion.timeline_ready()
+        if hasattr(self, "coach"):
+            self.coach.source_changed()
 
     def timeline_error(self, token, message):
         if self.video_revision == token:
@@ -543,6 +550,9 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "동영상 오류", message)
 
     def closeEvent(self, event):
+        if hasattr(self, "workflow") and not self.workflow.prepare_close():
+            event.ignore()
+            return
         if hasattr(self, "coach") and not self.coach.prepare_close():
             event.ignore()
             return

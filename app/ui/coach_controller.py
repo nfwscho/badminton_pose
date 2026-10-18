@@ -2,6 +2,8 @@
 # 영상/선수/손/측정/이벤트/규칙/사용자 확인 변경 시 결과를 오래된 것으로 표시한다.
 # 근거 탐색·강조·반복은 기존 A/B를 바꾸지 않으며 같은 선수의 현재 근거만 연결한다.
 # 저장된 결과/검토/메모/자동 이력을 분리 보존하고 실패 시 종료 전에 다시 저장한다.
+# 5.1에서는 A/B 변경과 선수/설정 변경을 구분하고 원본 캐시 조건을 검사한다.
+# 빈 패널을 간결하게 표시하며 사용자가 조절한 펼침 크기를 보존하고 통합 진단과 상태를 공유한다.
 from dataclasses import asdict
 import logging
 from pathlib import Path
@@ -14,6 +16,7 @@ from app.analysis.coach_models import CoachReview, ENGINE_VERSION, event_key, no
 from app.analysis.coach_rules import DEFAULT_RULES, load_rules
 from app.analysis.coach_store import CoachStore, export_reports
 from app.core.coach_worker import CoachWorker
+from app.core.frame_processor import cache_key
 from app.core.video_timeline import video_identity
 from app.ui.coach_panel import CoachPanel, ReviewDialog
 
@@ -30,6 +33,9 @@ class CoachController(QObject):
         self.evidence_range_active = False
         self.epoch, self.loaded_identity, self.dirty = 0, None, False
         self.signature = None
+        self.last_error = ""
+        self.last_panel_size = window.settings.value("coach/lastHeight", 280, type=int)
+        self.display_has_report = None
         self.rules_path = Path(window.settings.value("coach/rulesPath", str(DEFAULT_RULES)))
         self.rules, self.rules_stat = None, None
         self.load_rules(quiet=True)
@@ -82,11 +88,12 @@ class CoachController(QObject):
         self.source_changed()
 
     def show_panel(self, visible):
+        if not visible and self.panel.isVisible() and self.panel.report:
+            self.last_panel_size = self.w.content_splitter.sizes()[-1]
         self.panel.setVisible(visible)
         if visible:
             sizes = self.w.content_splitter.sizes()
-            sizes[-1] = max(sizes[-1], 220)
-            sizes[0] = max(sizes[0], 450)
+            sizes[-1] = self.last_panel_size if self.panel.report else 75
             self.w.content_splitter.setSizes(sizes)
 
     def selected_event(self):
@@ -97,15 +104,23 @@ class CoachController(QObject):
         document = m.document
         return (self.w.video_revision, self.w.selection_revision, self.w.measurement_revision,
                 id(self.w.cache.measurements), id(self.w.cache.frames), id(self.w.cache.selections),
-                document, m.historical, m.stale, m.hand_combo.currentData(), self.rules.key if self.rules else None,
+                document, m.historical, tuple(item for item in m.change_reasons() if item[0] != "scope"), m.hand_combo.currentData(), self.rules.key if self.rules else None,
                 tuple(sorted(self.confirmations.items())), self.panel.compare_check.isChecked(), self.panel.group_edit.text())
 
     def available(self):
         m = self.w.motion
         context = m.current_context()
+        key = self.w.cache.key
+        source_valid = bool(self.w.timeline and key and tuple(key[:3]) == tuple(self.w.timeline.identity))
+        workflow = getattr(self.w, "workflow", None)
+        if workflow and workflow.workers:
+            return False
+        if workflow and workflow.asset_signature == workflow.asset_key() and workflow.asset_valid is False:
+            source_valid = False
         return (self.rules is not None and m.document is not None and bool(m.document.events)
+                and source_valid
                 and self.w.timeline is not None and self.loaded_identity == tuple(self.w.timeline.identity)
-                and not m.historical and not m.stale and context is not None
+                and m.current_ready() and context is not None
                 and context["context_id"] == m.document.automatic.context_id
                 and context["player_id"] == m.document.automatic.player_id
                 and m.hand_combo.currentData() == m.document.automatic.racket_hand
@@ -121,6 +136,7 @@ class CoachController(QObject):
             self.reports, self.reviews, self.confirmations, self.history = {}, {}, {}, []
             self.live.clear()
             self.loaded_identity = identity
+            self.last_error = ""
             self.loaded_timeline = self.w.timeline
             if identity:
                 try:
@@ -155,7 +171,17 @@ class CoachController(QObject):
         self.panel.confirm_check.blockSignals(False)
         self.panel.confirm_check.setEnabled(event is not None)
         self.panel.set_report(report, self.reviews, stale)
+        has_report = report is not None
+        if self.display_has_report != has_report and self.panel_check.isChecked():
+            sizes = self.w.content_splitter.sizes()
+            if not has_report and self.display_has_report:
+                self.last_panel_size = sizes[-1]
+            sizes[-1] = max(240, self.last_panel_size) if has_report else 75
+            self.w.content_splitter.setSizes(sizes)
+        self.display_has_report = has_report
         self.update_controls()
+        if hasattr(self.w, "workflow"):
+            self.w.workflow.refresh()
 
     def is_stale(self, report):
         return (report is None or not self.available() or self.live.get(report.event_id) != self.current_signature()
@@ -163,7 +189,15 @@ class CoachController(QObject):
 
     def update_controls(self):
         busy, available = bool(self.workers), self.available()
-        self.analyze_button.setEnabled(available and self.selected_event() is not None and not busy)
+        event = self.selected_event()
+        valid = event is not None
+        if event and self.w.timeline:
+            from app.analysis.motion_models import validate_event
+            try:
+                validate_event(event, self.w.timeline, self.w.motion.document.events)
+            except (ValueError, TypeError):
+                valid = False
+        self.analyze_button.setEnabled(available and valid and not busy)
         self.panel.selected_button.setEnabled(self.analyze_button.isEnabled())
         self.panel.all_button.setEnabled(available and not busy)
         self.cancel_button.setEnabled(busy)
@@ -175,7 +209,7 @@ class CoachController(QObject):
         self.panel.evidence_button.setEnabled(usable)
         self.panel.review_button.setEnabled(message is not None)
         if not busy:
-            self.status.setText("현재 캐시로 관찰 분석 가능" if available else "관절·선수·손·현재 스윙 분석 필요 (과거/변경 결과 재계산)")
+            self.status.setText("현재 스윙 코칭 실행 가능" if available and valid else "스윙을 선택하세요 · 실행 조건 확인" if available else "실행 조건 확인에서 원인·해결 방법 보기")
 
     def options_changed(self):
         self.source_changed()
@@ -236,13 +270,25 @@ class CoachController(QObject):
         try:
             if video_identity(self.w.video_path) != self.w.timeline.identity:
                 raise ValueError("영상이 변경되었습니다. 다시 분석하세요.")
+            if cache_key(self.w.video_path) != self.w.cache.key:
+                raise ValueError("영상·모델 또는 관절 분석 설정이 바뀌었습니다. 실행 조건 확인에서 관절 캐시를 갱신하세요.")
         except Exception as exc:
             self.live.clear()
             self.show_error(str(exc))
+            if hasattr(self.w, "workflow"):
+                flow = self.w.workflow
+                flow.asset_signature, flow.asset_valid = flow.asset_key(), False
+                flow.asset_reason, flow.asset_action = str(exc), "pose"
+                try:
+                    if video_identity(self.w.video_path) != self.w.timeline.identity:
+                        flow.asset_action = "open"
+                except OSError:
+                    flow.asset_action = "open"
             self.refresh()
             return
         self.epoch += 1
         token, signature = self.epoch, self.current_signature()
+        self.last_error = ""
         ids = None if all_events else {self.selected_event().event_id}
         worker = CoachWorker(self.w.motion.document, self.w.cache.frames, self.w.cache.selections,
                              self.w.cache.measurements, self.w.timeline, self.rules, self.confirmations,
@@ -276,6 +322,8 @@ class CoachController(QObject):
             self.workers.remove(worker)
         worker.deleteLater()
         self.update_controls()
+        if hasattr(self.w, "workflow"):
+            self.w.workflow.refresh(force=True)
 
     def cancel(self):
         for worker in self.workers:
@@ -411,6 +459,7 @@ class CoachController(QObject):
         self.refresh()
 
     def show_error(self, message):
+        self.last_error = message
         log.error("코칭 기능 오류: %s", message)
         self.w.statusBar().showMessage(message)
 
@@ -429,4 +478,7 @@ class CoachController(QObject):
         self.w.settings.setValue("coach/showPanel", self.panel_check.isChecked())
         self.w.settings.setValue("coach/rulesPath", str(self.rules_path))
         self.w.settings.setValue("coach/splitter", self.w.content_splitter.saveState())
+        if self.panel.report and self.panel.isVisible():
+            self.last_panel_size = self.w.content_splitter.sizes()[-1]
+        self.w.settings.setValue("coach/lastHeight", self.last_panel_size)
         return True

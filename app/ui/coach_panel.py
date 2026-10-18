@@ -2,6 +2,7 @@
 # 분석 상태→실제 관찰→잠정 검토→촬영 제안 순으로 표시하며 기본 최대 3개만 노출한다.
 # 추가 결과/숨긴 결과 펼치기, 단계별 실제 특징, 조건부 반복 비교 및 검토 메모를 제공한다.
 # 모든 생성/파일/영상 작업은 컨트롤러에 위임하고 사용자 문자열은 일반 텍스트로 표시한다.
+# 결과가 없으면 세부/비교 컨트롤을 접어 안내만 표시하고 결과가 생기면 기존 탭을 복원한다.
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
                               QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton,
@@ -67,11 +68,15 @@ class CoachPanel(QWidget):
         self.loop_check = QCheckBox("근거 구간 반복 재생")
         self.save_button, self.reset_button, self.review_button = (QPushButton(s) for s in
             ("코칭 결과 저장", "코칭 결과 초기화", "확인·보류·오류·메모"))
+        self.options_check = QCheckBox("검토·비교 설정")
         for control in (self.selected_button, self.all_button, self.evidence_button, self.loop_check,
                         self.review_button, self.save_button, self.reset_button):
             row.addWidget(control)
+        row.addWidget(self.options_check)
         layout.addLayout(row)
-        row = QHBoxLayout()
+        self.options_bar = QWidget()
+        row = QHBoxLayout(self.options_bar)
+        row.setContentsMargins(0, 0, 0, 0)
         self.confirm_check = QCheckBox("현재 스윙·단계를 직접 확인함")
         self.confirm_check.setToolTip("현재 이벤트 경계와 관측된 단계를 확인합니다. 기술의 옳고 그름을 검증하는 기능은 아닙니다.")
         self.compare_check = QCheckBox("동일 고정 촬영·동일 기술 확인")
@@ -83,13 +88,13 @@ class CoachPanel(QWidget):
         for control in (self.confirm_check, self.compare_check, self.group_edit, self.more_check,
                         self.hidden_check, self.rules_button):
             row.addWidget(control)
-        layout.addLayout(row)
+        layout.addWidget(self.options_bar)
         self.status = QLabel("A. 분석 상태: 미분석 — 관절/스윙 캐시와 사용자 확인 필요")
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.status)
         self.tabs = QTabWidget()
-        self.tabs.setMinimumHeight(100)
+        self.tabs.setMinimumHeight(70)
         split = QSplitter(Qt.Orientation.Horizontal)
         self.list = QListWidget()
         self.list.setMinimumWidth(140)
@@ -111,6 +116,7 @@ class CoachPanel(QWidget):
         self.list.currentItemChanged.connect(self.on_selection)
         self.more_check.toggled.connect(self.populate)
         self.hidden_check.toggled.connect(self.populate)
+        self.options_check.toggled.connect(lambda visible: self.options_bar.setVisible(visible and self.report is not None))
 
     def selected_message(self):
         item = self.list.currentItem()
@@ -118,8 +124,14 @@ class CoachPanel(QWidget):
 
     def set_report(self, report, reviews, stale):
         self.report, self.reviews, self.stale = report, reviews, stale
+        self.options_bar.setVisible(report is not None and self.options_check.isChecked())
+        self.options_check.setVisible(report is not None)
+        self.tabs.setVisible(report is not None)
+        for button in (self.evidence_button, self.review_button, self.save_button, self.reset_button, self.loop_check):
+            button.setVisible(report is not None)
+        self.setMinimumHeight(160 if report is not None else 65)
         if report is None:
-            self.status.setText("A. 분석 상태: 선택 스윙 코칭 결과 없음")
+            self.status.setText("선택 스윙 코칭 결과 없음 — 상단 실행 조건 확인/다음 단계 실행으로 준비하세요. 스윙 검토는 상단 '검토 완료'에서 할 수 있습니다.")
             self.features.clear()
             self.comparison.setRowCount(0)
         else:
@@ -127,10 +139,10 @@ class CoachPanel(QWidget):
             detection = "관측 충분" if q.detection == "SUFFICIENT" else "관측 부족/무효"
             phase = {"UNKNOWN": "미확인", "PARTIAL_CANDIDATE": "일부 보류", "CANDIDATE": "자동 후보",
                      "USER_REVIEWED_CANDIDATE": "사용자 확인 후보"}.get(q.phase, q.phase)
-            self.status.setText(f"A. 분석 상태: {STATE_LABELS[q.state]}" +
+            self.status.setText(f"분석 요약 | 선택 스윙 {report.event_snapshot['start_frame']}–{report.event_snapshot['end_frame']}프레임 | {STATE_LABELS[q.state]}" +
                 (" | 오래된/저장된 결과 — 재계산 필요" if stale else "") +
-                f" | {detection}: {q.valid_frames}/{q.total_frames} 유효 관측 (정확도 확률 아님)"
-                f" | 단계 {phase} | 관찰 규칙만 적용\n" + "; ".join(q.reasons))
+                f"\n선수 추적: {detection} | 유효 {q.valid_frames}/{q.total_frames}프레임 (정확도 확률 아님) | 단계: {phase} | 관찰 규칙만 적용")
+            self.status.setToolTip("; ".join(q.reasons))
             lines = ["실제 캐시의 측정·파생값. 단계 이름은 후보이며 기술 정답 판정이 아닙니다.",
                      "극값의 peak_frame은 관측된 최소/최대 위치이며 타격 순간이 아닙니다."]
             for name, o in report.features.items():

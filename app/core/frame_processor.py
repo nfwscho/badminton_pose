@@ -3,12 +3,14 @@
 # 캐시는 영상 파일 정보, 모델 해시 및 검출 설정으로 식별하며 취소/오류 시
 # 이미 분석한 부분만 유지한다. 재생 디코더나 GUI의 캡처를 공유하지 않는다.
 # 추적된 캐시의 관절 수치 계산 및 CSV 저장도 별도 작업 스레드에 위임한다.
+# 캐시별 실행 ID를 부여하여 저장 스윙과 현재 관절 분석 실행의 출처를 구분한다.
 from dataclasses import dataclass, field, replace
 import hashlib
 import logging
 import math
 from pathlib import Path
 import time
+import uuid
 
 import cv2
 from PySide6.QtCore import QThread, Signal
@@ -36,6 +38,7 @@ class AnalysisCache:
     selections: dict = field(default_factory=dict)
     anchor: tuple[int, int] | None = None
     measurements: dict = field(default_factory=dict)
+    run_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
 
 class AnalysisWorker(QThread):
