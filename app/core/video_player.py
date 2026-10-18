@@ -1,6 +1,8 @@
 # 동영상 디코더와 재생 작업 스레드. MP4 열기, 순차 재생, 프레임 탐색을
 # 단일 작업 스레드에서 처리하고 영상/메타데이터/오류를 Qt 신호로 전달한다.
 # GUI 스레드에서는 OpenCV를 호출하지 않으며 종료 시 캡처 자원을 해제한다.
+# 선수 클릭 선택을 위한 명시적 일시정지 명령도 제공한다. AI 분석 캡처/결과와는
+# 독립적으로 동작하며 기존 frame_ready의 프레임 번호를 오버레이 동기화에 쓴다.
 import logging
 import math
 import queue
@@ -83,7 +85,10 @@ class VideoPlayer(QThread):
                         read_frame(0)
                         log.info("동영상 열기: %s, frames=%s, fps=%s", value, count, fps)
                     elif cap is not None:
-                        if command == "play":
+                        if command == "pause":
+                            pause()
+                            log.info("선수 선택을 위한 일시정지")
+                        elif command == "play":
                             if index >= count - 1:
                                 read_frame(0)
                             playing = not playing

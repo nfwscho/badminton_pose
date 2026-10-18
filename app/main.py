@@ -1,6 +1,7 @@
 # Windows 데스크톱 동영상 플레이어 진입점. 프로젝트 경로를 기준으로 로그와
 # UI 설정을 저장하고 실행/Qt 진단/미처리 예외를 파일과 콘솔에 기록한다.
-# 직접 실행과 python -m app.main 실행을 모두 지원하며 AI 추론은 수행하지 않는다.
+# 직접 실행과 python -m app.main 실행을 모두 지원한다. AI 모델 로딩/추론은
+# 사용자가 요청한 경우에만 별도 분석 스레드에서 수행한다.
 import logging
 from pathlib import Path
 import sys
