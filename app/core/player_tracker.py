@@ -2,6 +2,7 @@
 # 않고 몸통 위치/크기/관절 이동을 비교한다. 겹침, 누락, 큰 이동 또는 경쟁 후보가
 # 있으면 연결을 중단하고 이후 자동 복구하지 않는다. 선택 프레임에서 앞뒤로
 # 독립 추적하며 별도 QThread에서 캐시를 처리하여 재생/GUI 응답성을 유지한다.
+# 선택 세션 ID와 최초 중단 프레임/원인을 전파하여 수치 분석에서 신원을 섞지 않는다.
 from dataclasses import dataclass
 import logging
 import math
@@ -18,6 +19,8 @@ class FrameSelection:
     selected_pose_index: int | None
     state: str
     player_id: int = 1  # 이 선택 세션 안에서만 유효하며 영구 신원 ID가 아니다.
+    stop_frame: int | None = None
+    stop_reason: str | None = None
 
 
 def contains(box, x, y):
@@ -80,15 +83,16 @@ def match_person(previous, previous_poses, previous_index, poses):
     return index, "tracked"
 
 
-def track_selection(frames, anchor_frame, anchor_pose, cancelled=lambda: False):
+def track_selection(frames, anchor_frame, anchor_pose, cancelled=lambda: False, player_id=1):
     anchor = frames[anchor_frame]
     target = anchor.poses[anchor_pose]
     if not target.trackable:
         raise ValueError("선택한 선수의 몸통 관절 신뢰도가 부족합니다.")
-    selections = {anchor_frame: FrameSelection(anchor_frame, anchor_pose, "selected")}
+    selections = {anchor_frame: FrameSelection(anchor_frame, anchor_pose, "selected", player_id)}
     for direction in (1, -1):
         previous, previous_poses, previous_index = target, anchor.poses, anchor_pose
         stopped = crowded(target, anchor.poses, anchor_pose)
+        stop_frame, stop_reason = (anchor_frame, "identity_ambiguous") if stopped else (None, None)
         index = anchor_frame + direction
         lower, upper = min(frames), max(frames)
         while lower <= index <= upper:
@@ -96,18 +100,23 @@ def track_selection(frames, anchor_frame, anchor_pose, cancelled=lambda: False):
                 return {}
             frame = frames.get(index)
             if stopped:
-                selections[index] = FrameSelection(index, None, "reselect_required")
+                selections[index] = FrameSelection(index, None, "reselect_required", player_id, stop_frame, stop_reason)
             elif frame is None:
                 stopped = True
-                selections[index] = FrameSelection(index, None, "not_analyzed")
+                stop_frame, stop_reason = index, "not_analyzed"
+                selections[index] = FrameSelection(index, None, "not_analyzed", player_id, stop_frame, stop_reason)
             else:
                 match, state = match_person(previous, previous_poses, previous_index, frame.poses)
-                selections[index] = FrameSelection(index, match, state)
                 if match is None:
                     stopped = True
+                    stop_frame = index
+                    stop_reason = ("identity_ambiguous" if state == "ambiguous" else "not_detected" if not frame.poses
+                                   else "low_confidence" if not any(p.trackable for p in frame.poses) else "motion_or_identity_gate")
                     log.warning("선수 추적 실패: frame=%s, state=%s, direction=%s; 재선택 필요", index, state, direction)
+                    log.info("선수 추적 중단 근거: session=%s, frame=%s, reason=%s", player_id, index, stop_reason)
                 else:
                     previous, previous_poses, previous_index = frame.poses[match], frame.poses, match
+                selections[index] = FrameSelection(index, match, state, player_id, stop_frame, stop_reason)
             index += direction
     return selections
 
@@ -120,10 +129,11 @@ class TrackingWorker(QThread):
         super().__init__(parent)
         self.frames = dict(frames)
         self.anchor_frame, self.anchor_pose = anchor_frame, anchor_pose
+        self.player_id = 1
 
     def run(self):
         try:
-            result = track_selection(self.frames, self.anchor_frame, self.anchor_pose, self.isInterruptionRequested)
+            result = track_selection(self.frames, self.anchor_frame, self.anchor_pose, self.isInterruptionRequested, self.player_id)
             if not self.isInterruptionRequested():
                 self.ready.emit(result)
         except Exception as exc:

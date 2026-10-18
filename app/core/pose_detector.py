@@ -4,6 +4,7 @@
 # MediaPipe는 지연 import하여 모델/패키지 오류가 기존 플레이어를 막지 않는다.
 # 와이드 영상의 작은 선수를 위해 전체/좌/우 겹침 영역의 독립 VIDEO 인스턴스를
 # 사용하고 원본 좌표로 역변환한다. 중복 후보를 제거하고 최대 num_poses를 유지한다.
+# FrameResult는 원본 PTS 초와 MediaPipe용 증가 보정 시간을 별도로 보존할 수 있다.
 from dataclasses import dataclass
 import logging
 import math
@@ -76,6 +77,8 @@ class FrameResult:
     detection_success: bool
     status: str
     timestamp_source: str = "frame_index/fps"
+    timestamp_seconds: float | None = None
+    model_timestamp_ms: int | None = None
 
 
 def convert_result(result, width, x_offset, crop_width, source_view):

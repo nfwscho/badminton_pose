@@ -3,6 +3,7 @@
 # GUI 스레드에서는 OpenCV를 호출하지 않으며 종료 시 캡처 자원을 해제한다.
 # 선수 클릭 선택을 위한 명시적 일시정지 명령도 제공한다. AI 분석 캡처/결과와는
 # 독립적으로 동작하며 기존 frame_ready의 프레임 번호를 오버레이 동기화에 쓴다.
+# 비동기 인덱싱된 원본 PTS 시간축이 도착하면 재생 대기 간격에도 적용한다.
 import logging
 import math
 import queue
@@ -34,6 +35,12 @@ class VideoPlayer(QThread):
         playing = False
         index, count, fps = -1, 0, 30.0
         deadline = 0.0
+        timeline = None
+
+        def frame_interval():
+            if timeline is not None:
+                return max(0.001, timeline.frame_end(index) - timeline.seconds[index])
+            return 1 / fps
 
         def pause():
             nonlocal playing
@@ -80,19 +87,27 @@ class VideoPlayer(QThread):
                         if cap is not None:
                             cap.release()
                         cap, count, fps = candidate, int(new_count), new_fps
+                        current_path = str(Path(value).resolve())
+                        timeline = None
                         index = -1
                         self.opened.emit(str(Path(value).resolve()), count, fps)
                         read_frame(0)
                         log.info("동영상 열기: %s, frames=%s, fps=%s", value, count, fps)
                     elif cap is not None:
-                        if command == "pause":
+                        if command == "timeline":
+                            path, candidate_timeline = value
+                            if path == str(Path(current_path).resolve()) and len(candidate_timeline.seconds) == count:
+                                timeline = candidate_timeline
+                                if playing:
+                                    deadline = time.monotonic() + frame_interval()
+                        elif command == "pause":
                             pause()
                             log.info("선수 선택을 위한 일시정지")
                         elif command == "play":
                             if index >= count - 1:
                                 read_frame(0)
                             playing = not playing
-                            deadline = time.monotonic() + 1 / fps
+                            deadline = time.monotonic() + frame_interval()
                             self.playing_changed.emit(playing)
                             log.info("재생 상태: %s", playing)
                         elif command in ("seek", "step"):
@@ -106,7 +121,7 @@ class VideoPlayer(QThread):
                                 log.info("동영상 재생 완료")
                             else:
                                 read_frame()
-                                deadline = max(deadline + 1 / fps, time.monotonic())
+                                deadline = max(deadline + frame_interval(), time.monotonic())
                 except Exception as exc:
                     pause()
                     log.exception("동영상 처리 오류: command=%s", command)
