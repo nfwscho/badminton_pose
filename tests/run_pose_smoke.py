@@ -6,6 +6,8 @@
 # 검사한다. 기존 2단계 검증 동작은 유지하며 실제 시간축 기준으로 갱신했다.
 # --motion은 스윙 규칙/목록/타임라인/수동 문서 저장까지 검사한다. 수동 변경은
 # 별도의 검증 저장소에만 남기고 실제 영상 동작 정답 검증으로 해석하지 않는다.
+# --coach는 로컬 품질 보류/실제 관측 근거/검토 저장/내보내기와 그래프 연결을 검증한다.
+# 코칭 정확도 검증과 구분하며 사용자의 기존 코칭/메모 파일을 덮어쓰지 않는다.
 import argparse
 import csv
 import json
@@ -22,8 +24,11 @@ parser.add_argument("--video", type=Path)
 parser.add_argument("--offscreen", action="store_true")
 parser.add_argument("--measurements", action="store_true")
 parser.add_argument("--motion", action="store_true")
+parser.add_argument("--coach", action="store_true")
 parser.add_argument("--hand", choices=("right", "left"), default="right")
 args = parser.parse_args()
+if args.coach:
+    args.motion = True
 if args.motion:
     args.measurements = True
 if args.offscreen:
@@ -39,13 +44,17 @@ from app.core.player_tracker import crowded, descriptor, distance, pick_person
 from app.analysis.joint_angles import summarize
 from app.analysis.motion_detector import manual_event
 from app.analysis.motion_store import MotionStore
+from app.analysis.coach_store import CoachStore
+from app.analysis.coach_models import review_key
 
 
 def main():
     configure_logging()
     app = QApplication([])
     video = args.video or next((ROOT / "data" / "videos").glob("*.mp4"))
-    window = MainWindow(ROOT / "output" / ("motion_smoke_settings.ini" if args.motion else "pose_smoke_settings.ini"))
+    window = MainWindow(ROOT / "output" / ("coach_smoke_settings.ini" if args.coach else "motion_smoke_settings.ini" if args.motion else "pose_smoke_settings.ini"))
+    if args.coach:
+        window.coach.store = CoachStore(ROOT / "output" / "coach_smoke_events" / str(time.time_ns()))
     if args.motion:
         window.motion.store = MotionStore(ROOT / "output" / "motion_smoke_events" / str(time.time_ns()))
         window.motion.hand_combo.setCurrentIndex(window.motion.hand_combo.findData(args.hand))
@@ -66,6 +75,7 @@ def main():
 
     window.on_ai_error = error
     window.motion.show_error = error
+    window.coach.show_error = error
     window.player.error.disconnect(window.on_error)
     window.player.error.connect(error)
     window.player.request("open", str(video))
@@ -241,10 +251,77 @@ def main():
             elif stage == "motion_timeline" and abs(window.index - report["motion_target_frame"]) <= 1:
                 assert abs(window.motion.panel.cursor.value() - window.timeline.seconds[window.index]) < 1e-9
                 report["motion_timeline_mouse_sync"] = True
+                if args.coach:
+                    window.coach.run(True)
+                    stage = "coaching"
+                else:
+                    stage = "render"
+            elif stage == "coaching":
+                if window.coach.workers:
+                    report["ui_ticks_during_coaching"] = report.get("ui_ticks_during_coaching", 0) + 1
+                    return
+                coach = window.coach
+                assert coach.reports
+                current = coach.panel.report
+                assert current is not None
+                report["coach_reports"] = len(coach.reports)
+                report["coach_states"] = [r.quality.state for r in coach.reports.values()]
+                report["coach_messages"] = sum(len(r.messages) for r in coach.reports.values())
+                assert all(r.quality.state == "COACHING_DEFERRED" for r in coach.reports.values())
+                assert all(m.status == "COACHING_DEFERRED" for r in coach.reports.values() for m in r.messages)
+                for r in coach.reports.values():
+                    for m in r.messages:
+                        assert m.start_pts == window.timeline.raw_pts_seconds[m.start_frame]
+                        assert m.end_pts == window.timeline.raw_pts_seconds[m.end_frame]
+                        assert m.player_id == window.motion.document.automatic.player_id
+                message = next(m for m in current.messages if m.rule_id == "trunk_change")
+                coach.apply_review(message, "deferred", "통합검증용 메모 — 기술 평가 정답 아님")
+                loaded, reviews, _, _ = coach.store.load(window.timeline)
+                assert loaded[current.event_id] == coach.reports[current.event_id]
+                assert reviews[review_key(message.event_id, message.rule_id)].note
+                coach.export(ROOT / "output" / "coach_smoke_results.json")
+                coach.export(ROOT / "output" / "coach_smoke_results.csv")
+                report["coach_review_and_export_roundtrip"] = True
+                report["real_coaching_accuracy_validated"] = False
+                report["coach_json_path"] = str(coach.store.path_for(window.timeline.identity))
+                coach.panel.more_check.setChecked(True)
+                window.resize(1600, 1100)
+                # 목록/타임라인 검증 화면은 앞서 저장했다. 코칭 화면은 사용자가 접을 수 있는
+                # 기존 스윙 패널을 접어 관찰/보류/제안 문장을 읽을 수 있는 크기로 저장한다.
+                window.motion.panel_check.setChecked(False)
+                window.content_splitter.setSizes([500, 180, 0, 360])
+                report["coach_target_frame"] = message.start_frame
+                stage = "coach_click_pending"
+                def click_coach_result():
+                    nonlocal stage
+                    try:
+                        for i in range(coach.panel.list.count()):
+                            item = coach.panel.list.item(i)
+                            if item.data(Qt.ItemDataRole.UserRole).result_id == message.result_id:
+                                coach.panel.list.scrollToItem(item)
+                                coach.panel.list.setCurrentRow(-1)
+                                coach.panel.list.setCurrentRow(i)
+                                break
+                        assert coach.panel.selected_message().result_id == message.result_id
+                    except Exception as exc:
+                        report["errors"].append("코칭 목록 클릭: " + str(exc))
+                    stage = "coach_seek"
+                # 레이아웃 변경 후 별도 이벤트에서 클릭한다. 클릭 도중 processEvents로
+                # poll/창 닫기를 재진입시키지 않는다.
+                QTimer.singleShot(100, click_coach_result)
+            elif stage == "coach_seek" and window.index == report["coach_target_frame"]:
+                assert len(window.coach.markers) == 2
+                assert abs(window.measurement_panel.cursor.value() - window.timeline.seconds[window.index]) < 1e-9
+                report["coach_evidence_pts_and_graph_sync"] = True
+                report["coach_result_selection_sync"] = True
+                window.grab().save(str(ROOT / "output" / "coach_smoke_panel.png"))
+                window.player.request("seek", report["motion_target_frame"])
+                stage = "coach_render_seek"
+            elif stage == "coach_render_seek" and window.index == report["motion_target_frame"]:
                 stage = "render"
             elif stage == "render":
                 window.render_frame()
-                prefix = "motion_smoke" if args.motion else "measurements_smoke" if args.measurements else "pose_smoke"
+                prefix = "coach_smoke" if args.coach else "motion_smoke" if args.motion else "measurements_smoke" if args.measurements else "pose_smoke"
                 window.grab().save(str(ROOT / "output" / (prefix + "_overlay.png")))
                 annotated = window.video.pixmap().toImage()
                 window.overlay_check.setChecked(False)
@@ -272,7 +349,7 @@ def main():
     app.exec()
     report["elapsed_seconds"] = round(time.monotonic() - started, 2)
     report["passed"] = not failed and stage == "render" and not report["errors"]
-    output = ROOT / "output" / ("motion_smoke_report.json" if args.motion else "measurements_smoke_report.json" if args.measurements else "pose_smoke_report.json")
+    output = ROOT / "output" / ("coach_smoke_report.json" if args.coach else "motion_smoke_report.json" if args.motion else "measurements_smoke_report.json" if args.measurements else "pose_smoke_report.json")
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(report, ensure_ascii=True, indent=2))
     return 0 if report["passed"] else 1

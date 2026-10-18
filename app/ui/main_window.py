@@ -7,6 +7,8 @@
 # A/B 구간 및 CSV를 추가한다. 기존 추론 캐시와 재생 명령을 재사용한다.
 # MotionController로 스윙 후보/단계/타임라인/수동 검토를 연결하며 기존 측정·A/B
 # 데이터는 유지한다. 입력 변경/종료 시 새 작업의 취소 및 문서 보존도 요청한다.
+# CoachController로 품질 검사 기반 관찰·코칭 검토 패널, 근거 탐색과 사용자 검토를
+# 추가하며 기존 캐시와 A/B/스윙 데이터를 보존한다. 코칭도 종료 전 취소/저장한다.
 import logging
 from pathlib import Path
 
@@ -22,6 +24,7 @@ from app.core.video_timeline import TimelineWorker, video_identity
 from app.ui.pose_overlay import VideoLabel, draw_angle_overlay, draw_overlay
 from app.ui.measurement_panel import MeasurementPanel
 from app.ui.motion_controller import MotionController
+from app.ui.coach_controller import CoachController
 
 log = logging.getLogger(__name__)
 
@@ -160,6 +163,7 @@ class MainWindow(QMainWindow):
             check.setChecked(self.settings.value("metricVisible/" + key, check.isChecked(), type=bool))
         self.statusBar().showMessage("준비")
         self.motion = MotionController(self, settings_path, layout)
+        self.coach = CoachController(self, settings_path, layout)
         self.player.start()
 
     def set_controls(self, enabled):
@@ -268,6 +272,8 @@ class MainWindow(QMainWindow):
         self.measurement_panel.csv_button.setEnabled(bool(self.cache.measurements) and not self.measurement_pending and not self.export_workers)
         if hasattr(self, "motion"):
             self.motion.update_controls()
+        if hasattr(self, "coach"):
+            self.coach.update_controls()
 
     def start_analysis(self):
         if self.video_path is None or self.analysis_worker is not None:
@@ -537,6 +543,9 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "동영상 오류", message)
 
     def closeEvent(self, event):
+        if hasattr(self, "coach") and not self.coach.prepare_close():
+            event.ignore()
+            return
         if hasattr(self, "motion") and not self.motion.prepare_close():
             event.ignore()
             return

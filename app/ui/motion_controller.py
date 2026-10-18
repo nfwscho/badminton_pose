@@ -2,6 +2,7 @@
 # 독립 스레드/입력 세대 검사를 사용해 새 선수·영상·A/B·설정에 오래된 결과가
 # 적용되지 않게 한다. 자동 결과와 수동 문서를 분리하고 재분석 덮어쓰기 전에
 # 명시적으로 확인한다. 저장 기록은 현재 선수 캐시와 확인되기 전 과거 관측으로 표시한다.
+# 코칭 컨트롤러에는 문서/입력 상태 변경과 이벤트 선택 신호만 전달한다.
 from bisect import bisect_right
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
@@ -9,7 +10,7 @@ import json
 import logging
 
 import pyqtgraph as pg
-from PySide6.QtCore import QObject, Qt
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QHBoxLayout, QInputDialog, QLabel,
                               QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QWidget)
 
@@ -24,6 +25,9 @@ log = logging.getLogger(__name__)
 
 
 class MotionController(QObject):
+    changed = Signal()
+    selection_changed = Signal(str)
+
     def __init__(self, window, settings_path, main_layout):
         super().__init__(window)
         from pathlib import Path
@@ -268,6 +272,7 @@ class MotionController(QObject):
         self.draw_graph_phases()
         self.on_frame(self.w.index)
         self.update_controls()
+        self.changed.emit()
 
     def on_frame(self, index):
         if self.w.timeline and index < len(self.w.timeline.seconds):
@@ -296,6 +301,7 @@ class MotionController(QObject):
             self.w.measurement_panel.plot.setXRange(event.start_seconds, event.end_seconds, padding=0.03)
             self.draw_graph_phases()
             self.update_controls()
+            self.selection_changed.emit(event_id)
 
     def draw_graph_phases(self):
         plot = self.w.measurement_panel.plot
