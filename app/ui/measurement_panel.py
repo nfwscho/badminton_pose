@@ -2,6 +2,7 @@
 # 결측은 NaN으로 끊고 데이터 갱신은 선택/구간/표시 설정 변경 때만 수행한다.
 # 재생 중에는 시간 위치선과 현재 값만 갱신한다. 그래프 클릭을 영상 탐색으로
 # 전달하며 항목별 표시, 확대/축소, 범위 초기화와 원시/표시 평활화 선택을 제공한다.
+# 이벤트 선택 시 그래프 표시 범위만 별도 전환할 수 있어 기존 A/B 통계를 바꾸지 않는다.
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, Signal
@@ -20,6 +21,7 @@ class MeasurementPanel(QWidget):
         self.measurements, self.timeline, self.bounds = {}, None, None
         self.reload_count = 0
         self.current_index = 0
+        self.display_bounds = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         controls = QHBoxLayout()
@@ -77,6 +79,7 @@ class MeasurementPanel(QWidget):
 
     def set_data(self, measurements, timeline, a=None, b=None):
         self.measurements, self.timeline = measurements, timeline
+        self.display_bounds = None
         self.bounds = measurement_bounds(measurements, len(timeline.seconds), a, b) if timeline else None
         self.reload_curves()
         stats = summarize(measurements, timeline, self.bounds) if timeline else None
@@ -114,10 +117,11 @@ class MeasurementPanel(QWidget):
     def reload_curves(self):
         self.reload_count += 1
         times = np.asarray(self.timeline.seconds) if self.timeline else np.array([])
+        plot_bounds = self.display_bounds if self.display_bounds is not None else self.bounds
         for name, curve in self.curves.items():
             values = np.full(len(times), np.nan)
             for index, measurement in self.measurements.items():
-                if index >= len(times) or not self.bounds or not self.bounds[0] <= index <= self.bounds[1]:
+                if index >= len(times) or not plot_bounds or not plot_bounds[0] <= index <= plot_bounds[1]:
                     continue
                 metric = measurement.values[name]
                 if metric.valid:
@@ -129,6 +133,10 @@ class MeasurementPanel(QWidget):
                 connections[i] = (np.isfinite(values[i]) and np.isfinite(values[i + 1]) and a is not None and b is not None
                                   and a.track_segment is not None and a.track_segment == b.track_segment)
             curve.setData(times, values, connect=connections)
+
+    def focus_event(self, bounds):
+        self.display_bounds = bounds
+        self.reload_curves()
 
     def reset_view(self):
         if self.timeline:

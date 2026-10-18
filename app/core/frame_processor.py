@@ -13,7 +13,7 @@ import time
 import cv2
 from PySide6.QtCore import QThread, Signal
 from app.core.pose_detector import CONFIDENCE, DETECTION_VIEWS, MODEL_PATH, NUM_POSES, PoseDetector
-from app.core.video_timeline import read_timeline
+from app.core.video_timeline import read_timeline, video_identity
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +69,8 @@ class AnalysisWorker(QThread):
             if timeline is None:
                 state = "cancelled"
                 return
+            if timeline.identity != video_identity(self.video_path):
+                raise RuntimeError("시간축 생성 후 영상이 변경되었습니다. 영상을 다시 열고 분석하세요.")
             if len(timeline.seconds) != count:
                 raise RuntimeError("원본 시간축과 재생 디코더의 프레임 수가 다릅니다. 분석을 보류합니다.")
             detector = self.detector_factory(self.model_path)

@@ -4,6 +4,8 @@
 # 영상별 인식 정확도 및 영구 신원 보장은 이 자동 검증만으로 판단하지 않는다.
 # --measurements는 PTS/선수 세션별 측정, A/B 통계, CSV 일치, 각도/그래프 표시도
 # 검사한다. 기존 2단계 검증 동작은 유지하며 실제 시간축 기준으로 갱신했다.
+# --motion은 스윙 규칙/목록/타임라인/수동 문서 저장까지 검사한다. 수동 변경은
+# 별도의 검증 저장소에만 남기고 실제 영상 동작 정답 검증으로 해석하지 않는다.
 import argparse
 import csv
 import json
@@ -19,7 +21,11 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--video", type=Path)
 parser.add_argument("--offscreen", action="store_true")
 parser.add_argument("--measurements", action="store_true")
+parser.add_argument("--motion", action="store_true")
+parser.add_argument("--hand", choices=("right", "left"), default="right")
 args = parser.parse_args()
+if args.motion:
+    args.measurements = True
 if args.offscreen:
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
@@ -31,19 +37,25 @@ from app.ui.main_window import MainWindow
 from app.ui.pose_overlay import image_rect
 from app.core.player_tracker import crowded, descriptor, distance, pick_person
 from app.analysis.joint_angles import summarize
+from app.analysis.motion_detector import manual_event
+from app.analysis.motion_store import MotionStore
 
 
 def main():
     configure_logging()
     app = QApplication([])
     video = args.video or next((ROOT / "data" / "videos").glob("*.mp4"))
-    window = MainWindow(ROOT / "output" / "pose_smoke_settings.ini")
+    window = MainWindow(ROOT / "output" / ("motion_smoke_settings.ini" if args.motion else "pose_smoke_settings.ini"))
+    if args.motion:
+        window.motion.store = MotionStore(ROOT / "output" / "motion_smoke_events" / str(time.time_ns()))
+        window.motion.hand_combo.setCurrentIndex(window.motion.hand_combo.findData(args.hand))
+        window.motion.phase_check.setChecked(True)
     window.overlay_check.setChecked(True)
     window.angle_check.setChecked(args.measurements)
     window.panel_check.setChecked(args.measurements)
     window.measurement_panel.smooth_check.setChecked(False)
     if args.measurements:
-        window.resize(1200, 900)
+        window.resize(1200, 980 if args.motion else 900)
     window.show()
     report = {"video": str(video), "errors": [], "ui_ticks_during_analysis": 0}
     stage, anchor_index, anchor_pose, started = "open", None, None, time.monotonic()
@@ -53,6 +65,7 @@ def main():
         report["errors"].append(message)
 
     window.on_ai_error = error
+    window.motion.show_error = error
     window.player.error.disconnect(window.on_error)
     window.player.error.connect(error)
     window.player.request("open", str(video))
@@ -174,10 +187,64 @@ def main():
             elif stage == "graph_seek" and window.index == anchor_index + 5:
                 assert abs(window.measurement_panel.cursor.value() - window.timeline.seconds[window.index]) < 1e-9
                 report["graph_mouse_seek_synchronized"] = True
+                if args.motion:
+                    window.clear_range()
+                    window.motion.run_analysis()
+                    stage = "motion_analysis"
+                else:
+                    stage = "render"
+            elif stage == "motion_analysis" and not window.motion.workers:
+                motion = window.motion
+                assert motion.document is not None
+                automatic = motion.document.automatic
+                report["racket_hand_test_setting"] = args.hand
+                report["swing_auto_candidates"] = len(automatic.events)
+                report["swing_kinds"] = [e.kind for e in automatic.events]
+                report["swing_auto_ranges"] = [[e.start_frame, e.end_frame] for e in automatic.events]
+                report["swing_phases"] = [[p.phase for p in e.phases] for e in automatic.events]
+                report["motion_valid_observations"] = int(motion.features.valid.sum())
+                report["real_motion_accuracy_validated"] = False
+                if automatic.events:
+                    source = automatic.events[0]
+                    edited = manual_event(motion.document, window.timeline, source.start_frame, source.end_frame,
+                                          source.kind, source.phases, "통합검증용 수정(정답 아님)", source,
+                                          motion.features, window.cache.measurements)
+                else:
+                    valid_indices = [i for i, value in enumerate(motion.features.valid) if value]
+                    assert valid_indices
+                    a, b = valid_indices[0], valid_indices[min(20, len(valid_indices) - 1)]
+                    edited = manual_event(motion.document, window.timeline, a, b, "UNKNOWN", (),
+                                          "통합검증용 추가(정답 아님)", features=motion.features,
+                                          measurements=window.cache.measurements)
+                motion.apply_manual(edited, "smoke_edit" if automatic.events else "smoke_add")
+                reloaded = motion.store.load(window.timeline)
+                assert reloaded.events == motion.document.events
+                assert reloaded.automatic == automatic
+                report["manual_edit_and_json_reload"] = True
+                report["motion_json_path"] = str(motion.store.path_for(window.timeline.identity))
+                report["manual_test_event_id"] = edited.event_id
+                motion.select_event(edited.event_id)
+                stage = "motion_seek"
+            elif stage == "motion_seek":
+                motion = window.motion
+                event = motion.panel.selected_event()
+                if window.index != event.start_frame:
+                    return
+                window.grab().save(str(ROOT / "output" / "motion_smoke_list.png"))
+                motion.panel.tabs.setCurrentIndex(1)
+                report["motion_target_frame"] = min(event.end_frame, event.start_frame + 5)
+                target = window.timeline.seconds[report["motion_target_frame"]]
+                plot = motion.panel.timeline_plot
+                position = plot.mapFromScene(plot.getViewBox().mapViewToScene(QPointF(target, 0.5)))
+                QTest.mouseClick(plot.viewport(), Qt.MouseButton.LeftButton, pos=position)
+                stage = "motion_timeline"
+            elif stage == "motion_timeline" and abs(window.index - report["motion_target_frame"]) <= 1:
+                assert abs(window.motion.panel.cursor.value() - window.timeline.seconds[window.index]) < 1e-9
+                report["motion_timeline_mouse_sync"] = True
                 stage = "render"
             elif stage == "render":
                 window.render_frame()
-                prefix = "measurements_smoke" if args.measurements else "pose_smoke"
+                prefix = "motion_smoke" if args.motion else "measurements_smoke" if args.measurements else "pose_smoke"
                 window.grab().save(str(ROOT / "output" / (prefix + "_overlay.png")))
                 annotated = window.video.pixmap().toImage()
                 window.overlay_check.setChecked(False)
@@ -205,7 +272,7 @@ def main():
     app.exec()
     report["elapsed_seconds"] = round(time.monotonic() - started, 2)
     report["passed"] = not failed and stage == "render" and not report["errors"]
-    output = ROOT / "output" / ("measurements_smoke_report.json" if args.measurements else "pose_smoke_report.json")
+    output = ROOT / "output" / ("motion_smoke_report.json" if args.motion else "measurements_smoke_report.json" if args.measurements else "pose_smoke_report.json")
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(report, ensure_ascii=True, indent=2))
     return 0 if report["passed"] else 1

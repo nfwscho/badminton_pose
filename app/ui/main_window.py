@@ -5,6 +5,8 @@
 # 필터 골격 표시 및 취소/재분석을 제공한다. 원본 QPixmap은 항상 보존한다.
 # PTS 시간축, 선택 세션별 관절 수치/각도 오버레이, 접이식 그래프/통계 패널,
 # A/B 구간 및 CSV를 추가한다. 기존 추론 캐시와 재생 명령을 재사용한다.
+# MotionController로 스윙 후보/단계/타임라인/수동 검토를 연결하며 기존 측정·A/B
+# 데이터는 유지한다. 입력 변경/종료 시 새 작업의 취소 및 문서 보존도 요청한다.
 import logging
 from pathlib import Path
 
@@ -19,6 +21,7 @@ from app.core.player_tracker import FrameSelection, TrackingWorker, pick_person
 from app.core.video_timeline import TimelineWorker, video_identity
 from app.ui.pose_overlay import VideoLabel, draw_angle_overlay, draw_overlay
 from app.ui.measurement_panel import MeasurementPanel
+from app.ui.motion_controller import MotionController
 
 log = logging.getLogger(__name__)
 
@@ -156,6 +159,7 @@ class MainWindow(QMainWindow):
         for key, check in self.measurement_panel.checks.items():
             check.setChecked(self.settings.value("metricVisible/" + key, check.isChecked(), type=bool))
         self.statusBar().showMessage("준비")
+        self.motion = MotionController(self, settings_path, layout)
         self.player.start()
 
     def set_controls(self, enabled):
@@ -222,6 +226,8 @@ class MainWindow(QMainWindow):
             self.video.setPixmap(rendered.scaled(self.video.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         self.update_ai_controls()
         self.measurement_panel.update_current(self.index)
+        if hasattr(self, "motion"):
+            self.motion.on_frame(self.index)
 
     def update_ai_controls(self):
         busy = self.analysis_worker is not None
@@ -260,6 +266,8 @@ class MainWindow(QMainWindow):
         if self.cache.anchor is not None:
             self.track_status.setText(self.track_status.text() + (" | 관절 수치 계산 중" if self.measurement_pending else f" | 측정 가능 {self.measurement_usable_count}프레임"))
         self.measurement_panel.csv_button.setEnabled(bool(self.cache.measurements) and not self.measurement_pending and not self.export_workers)
+        if hasattr(self, "motion"):
+            self.motion.update_controls()
 
     def start_analysis(self):
         if self.video_path is None or self.analysis_worker is not None:
@@ -384,6 +392,8 @@ class MainWindow(QMainWindow):
         self.refresh_measurements()
         self.video.selecting = False
         self.video.unsetCursor()
+        if hasattr(self, "motion"):
+            self.motion.source_cleared()
         self.render_frame()
 
     def on_ai_error(self, message):
@@ -420,6 +430,8 @@ class MainWindow(QMainWindow):
         self.refresh_measurements()
         if self.cache.selections:
             self.start_measurements()
+        if hasattr(self, "motion"):
+            self.motion.timeline_ready()
 
     def timeline_error(self, token, message):
         if self.video_revision == token:
@@ -456,6 +468,8 @@ class MainWindow(QMainWindow):
             self.measurement_usable_count = sum(m.analyzable for m in measurements.values())
             self.refresh_measurements()
             self.render_frame()
+            if hasattr(self, "motion"):
+                self.motion.measurements_ready()
 
     def measurement_error(self, cache, revision, calculation, message):
         if self.cache is cache and revision == self.selection_revision and calculation == self.measurement_revision:
@@ -483,12 +497,16 @@ class MainWindow(QMainWindow):
         log.info("측정 구간 지정: A=%s, B=%s", self.range_a, self.range_b)
         self.refresh_measurements()
         self.measurement_panel.reset_view()
+        if hasattr(self, "motion"):
+            self.motion.invalidate()
 
     def clear_range(self):
         self.range_a = self.range_b = None
         log.info("측정 구간 초기화")
         self.refresh_measurements()
         self.measurement_panel.reset_view()
+        if hasattr(self, "motion"):
+            self.motion.invalidate()
 
     def choose_csv(self):
         if not self.cache.measurements or self.timeline is None:
@@ -519,6 +537,9 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "동영상 오류", message)
 
     def closeEvent(self, event):
+        if hasattr(self, "motion") and not self.motion.prepare_close():
+            event.ignore()
+            return
         self.cancel_analysis()
         for worker in self.timeline_workers + self.measurement_workers:
             worker.requestInterruption()

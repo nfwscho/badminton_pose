@@ -4,6 +4,8 @@
 # 선수 클릭 선택을 위한 명시적 일시정지 명령도 제공한다. AI 분석 캡처/결과와는
 # 독립적으로 동작하며 기존 frame_ready의 프레임 번호를 오버레이 동기화에 쓴다.
 # 비동기 인덱싱된 원본 PTS 시간축이 도착하면 재생 대기 간격에도 적용한다.
+# 선택 스윙의 포함 프레임 범위 재생/반복을 지원한다. 일반 재생/탐색/선수 선택
+# 명령은 구간 재생을 해제하여 기존 조작 흐름을 유지한다.
 import logging
 import math
 import queue
@@ -36,6 +38,7 @@ class VideoPlayer(QThread):
         index, count, fps = -1, 0, 30.0
         deadline = 0.0
         timeline = None
+        play_range = None
 
         def frame_interval():
             if timeline is not None:
@@ -89,6 +92,7 @@ class VideoPlayer(QThread):
                         cap, count, fps = candidate, int(new_count), new_fps
                         current_path = str(Path(value).resolve())
                         timeline = None
+                        play_range = None
                         index = -1
                         self.opened.emit(str(Path(value).resolve()), count, fps)
                         read_frame(0)
@@ -100,10 +104,28 @@ class VideoPlayer(QThread):
                                 timeline = candidate_timeline
                                 if playing:
                                     deadline = time.monotonic() + frame_interval()
+                        elif command == "play_range":
+                            a, b, loop = value
+                            if not 0 <= int(a) <= int(b) < count:
+                                raise ValueError("선택 스윙 재생 범위를 확인하세요.")
+                            play_range = (int(a), int(b), bool(loop))
+                            read_frame(int(a))
+                            playing = True
+                            deadline = time.monotonic() + frame_interval()
+                            self.playing_changed.emit(True)
+                            log.info("선택 스윙 재생: start=%s, end=%s, loop=%s", a, b, loop)
+                        elif command == "range_loop":
+                            if play_range is not None:
+                                play_range = (play_range[0], play_range[1], bool(value))
+                                log.info("선택 스윙 반복 설정: %s", bool(value))
+                        elif command == "clear_range":
+                            play_range = None
                         elif command == "pause":
+                            play_range = None
                             pause()
                             log.info("선수 선택을 위한 일시정지")
                         elif command == "play":
+                            play_range = None
                             if index >= count - 1:
                                 read_frame(0)
                             playing = not playing
@@ -111,12 +133,21 @@ class VideoPlayer(QThread):
                             self.playing_changed.emit(playing)
                             log.info("재생 상태: %s", playing)
                         elif command in ("seek", "step"):
+                            play_range = None
                             pause()
                             target = int(value) if command == "seek" else index + int(value)
                             read_frame(max(0, min(count - 1, target)))
                             log.info("프레임 이동: %s", index)
                         elif command == "tick":
-                            if index >= count - 1:
+                            if play_range is not None and index >= play_range[1]:
+                                if play_range[2]:
+                                    read_frame(play_range[0])
+                                    deadline = max(deadline + frame_interval(), time.monotonic())
+                                else:
+                                    pause()
+                                    play_range = None
+                                    log.info("선택 스윙 재생 완료")
+                            elif index >= count - 1:
                                 pause()
                                 log.info("동영상 재생 완료")
                             else:
