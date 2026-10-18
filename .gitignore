@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/videos/
+logs/
+output/
+*.db
+.tools/
+.runtime/
+.uv-cache/
